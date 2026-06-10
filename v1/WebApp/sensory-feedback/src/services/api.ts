@@ -25,6 +25,13 @@ export const BleEndpoints = {
   MODE: 'MODE',
   SENSITIVITY: 'SENSITIVITY',
   GETLOG: 'GETLOG',
+  // Motion mode (default ON in firmware): sound responds to CHANGE in pressure and
+  // fades to silence when steady. The SENSITIVITY slider also shifts the motion
+  // front/back dead-zone balance, so it keeps working without extra UI.
+  MOTION: 'MOTION',           // "1"/"0"
+  MOTIONCFG: 'MOTIONCFG',     // "front,back,gain,decay"
+  GETCAL: 'GETCAL',
+  RANGE: 'RANGE',             // "id,value"
 } as const;
 
 // ---------- Diagnostic Log ----------
@@ -101,6 +108,12 @@ class SensorSimulator {
 
 const simulator = new SensorSimulator(4);
 let latestSensorData: Sensors = [];
+// Latest calibration snapshot from the firmware (GETCAL response)
+export interface CalibrationState {
+  base: number[]; thr: number[]; rng: number[];
+  locked: number; motion: number; mdf: number; mdb: number;
+}
+let latestCal: CalibrationState | null = null;
 // Raw normalized values (0-100) before calibration subtraction - used for calibration
 let latestRawNormalized: number[] = [0, 0, 0, 0];
 // Calibration baselines stored in normalized 0-100 range for display adjustment
@@ -149,12 +162,25 @@ export const EspApi = {
                 }
                 return;
             }
-            // Compact format: {"t":millis,"s":[val0,val1,val2,val3]}
+            // Calibration response from GETCAL: {"cal":{...}}
+            if (parsed.cal !== undefined) {
+                latestCal = parsed.cal;
+                return;
+            }
+            // Compact format: {"t":millis,"s":[raw0..3],"n":[norm0..3]}
+            // Prefer the firmware's per-sensor normalized "n" (0-100% of each
+            // sensor's OWN learned range) over the old amplitude/4095 approach.
             if (parsed.s && Array.isArray(parsed.s)) {
+                const hasN = Array.isArray(parsed.n);
                 latestSensorData = parsed.s.map((amplitude: number, index: number) => {
-                    const normalized = Math.min(100, (amplitude / 4095) * 100);
+                    const normalized = hasN
+                        ? Math.min(100, parsed.n[index])
+                        : Math.min(100, (amplitude / 4095) * 100);
                     latestRawNormalized[index] = normalized;
-                    const calibrated = Math.max(0, normalized - (calibrationBaselines[index] || 0));
+                    // With firmware normalization, baseline subtraction is already done
+                    const calibrated = hasN
+                        ? normalized
+                        : Math.max(0, normalized - (calibrationBaselines[index] || 0));
                     return {
                         id: index,
                         data: [{ time: new Date(), amplitude: calibrated }]
@@ -232,10 +258,31 @@ export const EspApi = {
   setMode: (mode: AudioMode): void => {
     EspApi.write(BleEndpoints.MODE, `${mode}`);
   },
-  // Sensitivity slider: 0=back sensitive, 50=balanced, 100=front sensitive
+  // Sensitivity slider: 0=back sensitive, 50=balanced, 100=front sensitive.
+  // In motion mode this same slider shifts the front/back motion dead-zone balance
+  // (the firmware maps SENSITIVITY to both the exp curve and the motion thresholds).
   setSensitivity: (value: number): void => {
     EspApi.write(BleEndpoints.SENSITIVITY, `${value}`);
   },
+
+  // ---------- Motion mode ----------
+  // Motion mode (default ON): sound follows pressure CHANGE, silent when steady.
+  setMotionMode: (on: boolean): void => {
+    EspApi.write(BleEndpoints.MOTION, on ? '1' : '0');
+  },
+  // Direct per-zone tuning: front/back dead-zone, gain (x100), decay (x100).
+  setMotionConfig: (front: number, back: number, gainx100: number, decayx100: number): void => {
+    EspApi.write(BleEndpoints.MOTIONCFG, `${front},${back},${gainx100},${decayx100}`);
+  },
+  // Manual ceiling override for one sensor's range.
+  setRange: (id: number, value: number): void => {
+    EspApi.write(BleEndpoints.RANGE, `${id},${value}`);
+  },
+  // Request the firmware's current calibration/motion state (arrives as {"cal":...}).
+  requestCalibration: (): void => {
+    EspApi.write(BleEndpoints.GETCAL, '1');
+  },
+  getLastCalibration: (): CalibrationState | null => latestCal,
   getVolume: (): number => {
     // TODO: Implement communication with ESP32
     console.log('getVolume');

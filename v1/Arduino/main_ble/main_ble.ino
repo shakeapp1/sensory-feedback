@@ -48,9 +48,12 @@ float motionGain  = 2.2f;        // how strongly a change spikes the sound
 // Per-sensor motion dead-zone — restores the front/back intensity transfer inside
 // motion mode: FRONT of foot is more responsive (lower threshold), HEEL firmer.
 // (Yehuda's request — motion mode should still honor front/back.)
-int   motionMinDeltaFront = 50;  // front sensors: catch lighter movement
-int   motionMinDeltaBack  = 70;  // heel sensors: need firmer movement
-int   motionMinDelta[4]   = {70, 50, 50, 70};  // {heel, front, front, heel} per mapping (measured ~25-30 at rest, real motion 140+)
+// Defaults chosen from Shira's recorded data (8.6.2026): fronts are quieter at
+// rest (thr 70 sits just above jitter); heels are noisier — esp. the left-heel
+// anchor — so 100 filters the steady-load drone. Tunable live via SENSITIVITY.
+int   motionMinDeltaFront = 70;  // front sensors: catch toe movement, above jitter
+int   motionMinDeltaBack  = 100; // heel sensors: firmer — the steady anchor stays quiet
+int   motionMinDelta[4]   = {100, 70, 70, 100};  // {heel, front, front, heel} per mapping (measured ~25-30 at rest, real motion 140+)
 
 // ---- Power bank keep-alive: sub-audible tone via amp when idle ----
 // Starts only after 10s with no sensor activity; stops immediately on press.
@@ -784,12 +787,23 @@ void processCommand(const String& value) {
       if (s < 0) s = 0;
       if (s > 100) s = 100;
       float t = s / 100.0f;
-      // Map slider to exponents: higher exponent = less sensitive
+      // Map slider to exponents (used in non-motion path): higher exp = less sensitive
       frontExp = 2.0f - t * 1.7f;   // 2.0 at s=0 → 0.3 at s=100
-      backExp  = 0.3f + t * 1.7f;   // 0.3 at s=0 → 2.0 at s=100
+      backExp  = 0.3f + t * 1.7f;
       prefs.putFloat("fexp", frontExp);
       prefs.putFloat("bexp", backExp);
-      Serial.printf("Sensitivity: slider=%d front=%.2f back=%.2f (saved)\n", (int)s, frontExp, backExp);
+      // ALSO shift the MOTION dead-zones front<->back with the SAME slider, so one
+      // control balances front/back responsiveness in motion mode too. (Yehuda)
+      // s=100 (front-sensitive): front low(50), heel high(120).
+      // s=0   (back-sensitive):  front high(110), heel low(60).
+      // s=50  (balanced):        ~ default 70 / 100.
+      motionMinDeltaFront = (int)(110 - t * 60);   // 110..50
+      motionMinDeltaBack  = (int)(60  + t * 60);   // 60..120
+      for (int i = 0; i < 4; i++) motionMinDelta[i] = sensorIsFront[i] ? motionMinDeltaFront : motionMinDeltaBack;
+      prefs.putInt("mdf", motionMinDeltaFront);
+      prefs.putInt("mdb", motionMinDeltaBack);
+      Serial.printf("Sensitivity slider=%d -> exp f=%.2f b=%.2f | motion front=%d back=%d (saved)\n",
+        (int)s, frontExp, backExp, motionMinDeltaFront, motionMinDeltaBack);
     }
     else if (strcmp(command, "GETCAL") == 0) {
       needSendCal = true;   // wifiTask sends current calibration as JSON
@@ -882,11 +896,11 @@ void bleTask(void *parameter) {
       needSendCal = false;
       char calMsg[200];
       snprintf(calMsg, sizeof(calMsg),
-        "{\"cal\":{\"base\":[%d,%d,%d,%d],\"thr\":[%d,%d,%d,%d],\"rng\":[%d,%d,%d,%d],\"locked\":%d}}",
+        "{\"cal\":{\"base\":[%d,%d,%d,%d],\"thr\":[%d,%d,%d,%d],\"rng\":[%d,%d,%d,%d],\"locked\":%d,\"motion\":%d,\"mdf\":%d,\"mdb\":%d}}",
         (int)sensorBaselines[0], (int)sensorBaselines[1], (int)sensorBaselines[2], (int)sensorBaselines[3],
         (int)sensorThresholds[0], (int)sensorThresholds[1], (int)sensorThresholds[2], (int)sensorThresholds[3],
         (int)sensorRange[0], (int)sensorRange[1], (int)sensorRange[2], (int)sensorRange[3],
-        autocalLocked ? 1 : 0);
+        autocalLocked ? 1 : 0, motionMode ? 1 : 0, motionMinDeltaFront, motionMinDeltaBack);
       bleSend(calMsg); vTaskDelay(pdMS_TO_TICKS(20));
     }
     if (needSendLog) {
@@ -973,6 +987,10 @@ void setup() {
   autocalLocked = false;   // re-learn ranges/thresholds every boot
   keepAliveEnabled = prefs.getBool("kaon", false);
   motionMode = prefs.getBool("motion", true);   // default ON — fits Shira's standing pattern
+  // restore motion dead-zones (taste setting); defaults 70 front / 100 back
+  motionMinDeltaFront = prefs.getInt("mdf", motionMinDeltaFront);
+  motionMinDeltaBack  = prefs.getInt("mdb", motionMinDeltaBack);
+  for (int i = 0; i < 4; i++) motionMinDelta[i] = sensorIsFront[i] ? motionMinDeltaFront : motionMinDeltaBack;
   Serial.printf("Fresh-calibration boot. mvol %.2f motion %d (thresholds/ranges learn this session)\n",
     masterVol, motionMode ? 1 : 0);
   Serial.printf("Restored mode: %d (%s)\n", audioMode, audioMode == 1 ? "Song" : "Accordion");
