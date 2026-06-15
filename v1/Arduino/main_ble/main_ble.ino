@@ -51,9 +51,11 @@ float motionGain  = 2.2f;        // how strongly a change spikes the sound
 // Defaults chosen from Shira's recorded data (8.6.2026): fronts are quieter at
 // rest (thr 70 sits just above jitter); heels are noisier — esp. the left-heel
 // anchor — so 100 filters the steady-load drone. Tunable live via SENSITIVITY.
-int   motionMinDeltaFront = 70;  // front sensors: catch toe movement, above jitter
-int   motionMinDeltaBack  = 100; // heel sensors: firmer — the steady anchor stays quiet
-int   motionMinDelta[4]   = {100, 70, 70, 100};  // {heel, front, front, heel} per mapping (measured ~25-30 at rest, real motion 140+)
+// Dead-zone as a FRACTION of each sensor's LIVE session span (obsMax-obsMin).
+// Front catches lighter movement (smaller fraction); heel firmer (larger).
+float motionDeadFracFront = 0.10f;   // front: 10% of its own session range
+float motionDeadFracBack  = 0.18f;   // heel:  18% of its own session range
+#define MOTION_SPAN_FLOOR 120        // min span until the session reveals the real range (measured ~25-30 at rest, real motion 140+)
 
 // ---- Power bank keep-alive: sub-audible tone via amp when idle ----
 // Starts only after 10s with no sensor activity; stops immediately on press.
@@ -792,18 +794,15 @@ void processCommand(const String& value) {
       backExp  = 0.3f + t * 1.7f;
       prefs.putFloat("fexp", frontExp);
       prefs.putFloat("bexp", backExp);
-      // ALSO shift the MOTION dead-zones front<->back with the SAME slider, so one
-      // control balances front/back responsiveness in motion mode too. (Yehuda)
-      // s=100 (front-sensitive): front low(50), heel high(120).
-      // s=0   (back-sensitive):  front high(110), heel low(60).
-      // s=50  (balanced):        ~ default 70 / 100.
-      motionMinDeltaFront = (int)(110 - t * 60);   // 110..50
-      motionMinDeltaBack  = (int)(60  + t * 60);   // 60..120
-      for (int i = 0; i < 4; i++) motionMinDelta[i] = sensorIsFront[i] ? motionMinDeltaFront : motionMinDeltaBack;
-      prefs.putInt("mdf", motionMinDeltaFront);
-      prefs.putInt("mdb", motionMinDeltaBack);
-      Serial.printf("Sensitivity slider=%d -> exp f=%.2f b=%.2f | motion front=%d back=%d (saved)\n",
-        (int)s, frontExp, backExp, motionMinDeltaFront, motionMinDeltaBack);
+      // ALSO shift the MOTION dead-zone fractions front<->back with the SAME slider.
+      // s=100 (front-sensitive): front frac low, heel frac high.
+      // s=0   (back-sensitive):  front frac high, heel frac low. s=50: balanced.
+      motionDeadFracFront = 0.18f - t * 0.12f;   // 0.18..0.06
+      motionDeadFracBack  = 0.10f + t * 0.16f;   // 0.10..0.26
+      prefs.putFloat("mdf", motionDeadFracFront);
+      prefs.putFloat("mdb", motionDeadFracBack);
+      Serial.printf("Sensitivity slider=%d -> exp f=%.2f b=%.2f | motion frac front=%.2f back=%.2f (saved)\n",
+        (int)s, frontExp, backExp, motionDeadFracFront, motionDeadFracBack);
     }
     else if (strcmp(command, "GETCAL") == 0) {
       needSendCal = true;   // wifiTask sends current calibration as JSON
@@ -835,24 +834,25 @@ void processCommand(const String& value) {
       Serial.printf("Motion mode: %s (saved)\n", motionMode ? "ON" : "OFF");
     }
     else if (strcmp(command, "MOTIONCFG") == 0) {
-      // "front,back,gainx100,decayx100" — separate front/back dead-zones (Yehuda).
-      // Falls back to "minDelta,gainx100,decayx100" (uniform) for compatibility.
+      // "frontPct,backPct,gainx100,decayx100" — dead-zone as % of each sensor's
+      // live session span (e.g. 10,18,220,88). Lower % = more sensitive. (Yehuda)
       int v[4];
       if (parseCsvInts(data, v, 4) == 4) {
-        motionMinDeltaFront = v[0];
-        motionMinDeltaBack  = v[1];
+        motionDeadFracFront = v[0] / 100.0f;
+        motionDeadFracBack  = v[1] / 100.0f;
         motionGain = v[2] / 100.0f;
         motionDecay = v[3] / 100.0f;
-        for (int i = 0; i < 4; i++) motionMinDelta[i] = sensorIsFront[i] ? motionMinDeltaFront : motionMinDeltaBack;
-        Serial.printf("MotionCfg: front=%d back=%d gain=%.2f decay=%.2f\n",
-          motionMinDeltaFront, motionMinDeltaBack, motionGain, motionDecay);
+        prefs.putFloat("mdf", motionDeadFracFront);
+        prefs.putFloat("mdb", motionDeadFracBack);
+        Serial.printf("MotionCfg: frontFrac=%.2f backFrac=%.2f gain=%.2f decay=%.2f\n",
+          motionDeadFracFront, motionDeadFracBack, motionGain, motionDecay);
       } else {
         int v3[3];
         if (parseCsvInts(data, v3, 3) == 3) {
-          for (int i = 0; i < 4; i++) motionMinDelta[i] = v3[0];
+          motionDeadFracFront = motionDeadFracBack = v3[0] / 100.0f;
           motionGain = v3[1] / 100.0f;
           motionDecay = v3[2] / 100.0f;
-          Serial.printf("MotionCfg(uniform): minDelta=%d gain=%.2f decay=%.2f\n", v3[0], motionGain, motionDecay);
+          Serial.printf("MotionCfg(uniform): frac=%.2f gain=%.2f decay=%.2f\n", motionDeadFracFront, motionGain, motionDecay);
         }
       }
     }
@@ -896,11 +896,10 @@ void bleTask(void *parameter) {
       needSendCal = false;
       char calMsg[200];
       snprintf(calMsg, sizeof(calMsg),
-        "{\"cal\":{\"base\":[%d,%d,%d,%d],\"thr\":[%d,%d,%d,%d],\"rng\":[%d,%d,%d,%d],\"locked\":%d,\"motion\":%d,\"mdf\":%d,\"mdb\":%d}}",
-        (int)sensorBaselines[0], (int)sensorBaselines[1], (int)sensorBaselines[2], (int)sensorBaselines[3],
-        (int)sensorThresholds[0], (int)sensorThresholds[1], (int)sensorThresholds[2], (int)sensorThresholds[3],
-        (int)sensorRange[0], (int)sensorRange[1], (int)sensorRange[2], (int)sensorRange[3],
-        autocalLocked ? 1 : 0, motionMode ? 1 : 0, motionMinDeltaFront, motionMinDeltaBack);
+        "{\"cal\":{\"obsmin\":[%d,%d,%d,%d],\"obsmax\":[%d,%d,%d,%d],\"motion\":%d,\"mdf\":%.2f,\"mdb\":%.2f}}",
+        obsMin[0], obsMin[1], obsMin[2], obsMin[3],
+        obsMax[0], obsMax[1], obsMax[2], obsMax[3],
+        motionMode ? 1 : 0, motionDeadFracFront, motionDeadFracBack);
       bleSend(calMsg); vTaskDelay(pdMS_TO_TICKS(20));
     }
     if (needSendLog) {
@@ -988,9 +987,8 @@ void setup() {
   keepAliveEnabled = prefs.getBool("kaon", false);
   motionMode = prefs.getBool("motion", true);   // default ON — fits Shira's standing pattern
   // restore motion dead-zones (taste setting); defaults 70 front / 100 back
-  motionMinDeltaFront = prefs.getInt("mdf", motionMinDeltaFront);
-  motionMinDeltaBack  = prefs.getInt("mdb", motionMinDeltaBack);
-  for (int i = 0; i < 4; i++) motionMinDelta[i] = sensorIsFront[i] ? motionMinDeltaFront : motionMinDeltaBack;
+  motionDeadFracFront = prefs.getFloat("mdf", motionDeadFracFront);
+  motionDeadFracBack  = prefs.getFloat("mdb", motionDeadFracBack);
   Serial.printf("Fresh-calibration boot. mvol %.2f motion %d (thresholds/ranges learn this session)\n",
     masterVol, motionMode ? 1 : 0);
   Serial.printf("Restored mode: %d (%s)\n", audioMode, audioMode == 1 ? "Song" : "Accordion");
@@ -1178,12 +1176,18 @@ void loop() {
         int force = sensorValues[i] - sensorBaselines[i];
         if (force < 0) force = 0;
 
-        // MOTION mode: drive sound from pressure CHANGE, decaying to silence when steady
+        // MOTION mode: drive sound from pressure CHANGE, decaying to silence when steady.
+        // Range is ACQUIRED LIVE this session (obsMin..obsMax per sensor), so a
+        // poorly-placed sensor with a small swing still gets full scale. (Yehuda)
         if (motionMode) {
+          int span = obsMax[i] - obsMin[i];
+          if (span < MOTION_SPAN_FLOOR) span = MOTION_SPAN_FLOOR;  // until the session reveals the range
+          // dead-zone is a FRACTION of this sensor's own session span (front lower, heel higher)
+          int dz = (int)(span * (sensorIsFront[i] ? motionDeadFracFront : motionDeadFracBack));
           int delta = force - prevForce[i];
           if (delta < 0) delta = -delta;            // rise or fall both count as motion
-          if (delta < motionMinDelta[i]) delta = 0; // per-sensor dead-zone (front lower, heel higher)
-          float spike = (float)delta / (float)sensorRange[i] * motionGain;
+          if (delta < dz) delta = 0;                // relative dead-zone
+          float spike = (float)delta / (float)span * motionGain;
           motionLevel[i] = motionLevel[i] * motionDecay + spike;
           if (motionLevel[i] > 1.0f) motionLevel[i] = 1.0f;
           prevForce[i] = force;
